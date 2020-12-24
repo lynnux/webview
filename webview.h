@@ -28,6 +28,11 @@
 #define WEBVIEW_API extern
 #endif
 
+#if defined(_MSC_VER) && _MSC_VER < 1900
+#define DISABLE_LOCAL_EDGE
+#define snprintf _snprintf
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -749,12 +754,14 @@ using browser_engine = cocoa_wkwebview_engine;
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "Shlwapi.lib")
 
+#ifndef DISABLE_LOCAL_EDGE
 // EdgeHTML headers and libs
 #include <objbase.h>
 #include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Web.UI.Interop.h>
 #pragma comment(lib, "windowsapp")
+#endif
 
 // Edge/Chromium headers and libs
 #include "webview2.h"
@@ -776,6 +783,7 @@ public:
   virtual void resize(HWND) = 0;
 };
 
+#ifndef DISABLE_LOCAL_EDGE
 //
 // EdgeHTML browser engine
 //
@@ -848,6 +856,7 @@ private:
   WebViewControl m_webview = nullptr;
   std::string init_js = "";
 };
+#endif
 
 //
 // Edge/Chromium browser engine
@@ -995,73 +1004,79 @@ private:
 
 class win32_edge_engine {
 public:
-  win32_edge_engine(bool debug, void *window) {
-    if (window == nullptr) {
-      HINSTANCE hInstance = GetModuleHandle(nullptr);
-      HICON icon = (HICON)LoadImage(
-          hInstance, IDI_APPLICATION, IMAGE_ICON, GetSystemMetrics(SM_CXSMICON),
-          GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR);
-
-      WNDCLASSEX wc;
-      ZeroMemory(&wc, sizeof(WNDCLASSEX));
-      wc.cbSize = sizeof(WNDCLASSEX);
-      wc.hInstance = hInstance;
-      wc.lpszClassName = "webview";
-      wc.hIcon = icon;
-      wc.hIconSm = icon;
-      wc.lpfnWndProc =
-          (WNDPROC)(+[](HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) -> int {
+    static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+        {
             auto w = (win32_edge_engine *)GetWindowLongPtr(hwnd, GWLP_USERDATA);
             switch (msg) {
             case WM_SIZE:
-              w->m_browser->resize(hwnd);
-              break;
+                w->m_browser->resize(hwnd);
+                break;
             case WM_CLOSE:
-              DestroyWindow(hwnd);
-              break;
+                DestroyWindow(hwnd);
+                break;
             case WM_DESTROY:
-              w->terminate();
-              break;
+                w->terminate();
+                break;
             case WM_GETMINMAXINFO: {
-              auto lpmmi = (LPMINMAXINFO)lp;
-              if (w == nullptr) {
-                return 0;
-              }
-              if (w->m_maxsz.x > 0 && w->m_maxsz.y > 0) {
-                lpmmi->ptMaxSize = w->m_maxsz;
-                lpmmi->ptMaxTrackSize = w->m_maxsz;
-              }
-              if (w->m_minsz.x > 0 && w->m_minsz.y > 0) {
-                lpmmi->ptMinTrackSize = w->m_minsz;
-              }
+                auto lpmmi = (LPMINMAXINFO)lp;
+                if (w == nullptr) {
+                    return 0;
+                }
+                if (w->m_maxsz.x > 0 && w->m_maxsz.y > 0) {
+                    lpmmi->ptMaxSize = w->m_maxsz;
+                    lpmmi->ptMaxTrackSize = w->m_maxsz;
+                }
+                if (w->m_minsz.x > 0 && w->m_minsz.y > 0) {
+                    lpmmi->ptMinTrackSize = w->m_minsz;
+                }
             } break;
             default:
-              return DefWindowProc(hwnd, msg, wp, lp);
+                return DefWindowProc(hwnd, msg, wp, lp);
             }
             return 0;
-          });
-      RegisterClassEx(&wc);
-      m_window = CreateWindow("webview", "", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
-                              CW_USEDEFAULT, 640, 480, nullptr, nullptr,
-                              GetModuleHandle(nullptr), nullptr);
-      SetWindowLongPtr(m_window, GWLP_USERDATA, (LONG_PTR)this);
-    } else {
-      m_window = *(static_cast<HWND *>(window));
-    }
+        }
+    win32_edge_engine(bool debug, void *window) {
+        if (window == nullptr) {
+            HINSTANCE hInstance = GetModuleHandle(nullptr);
+            HICON icon = (HICON) LoadImage(
+                hInstance, IDI_APPLICATION, IMAGE_ICON,
+                GetSystemMetrics(SM_CXSMICON), 
+                GetSystemMetrics(SM_CYSMICON), 
+                LR_DEFAULTCOLOR);
 
-    ShowWindow(m_window, SW_SHOW);
-    UpdateWindow(m_window);
-    SetFocus(m_window);
+            WNDCLASSEX wc;
+            ZeroMemory(&wc, sizeof(WNDCLASSEX));
+            wc.cbSize = sizeof(WNDCLASSEX);
+            wc.hInstance = hInstance;
+            wc.lpszClassName = "webview";
+            wc.hIcon = icon;
+            wc.hIconSm = icon;
+            wc.lpfnWndProc =
+                (WNDPROC)WndProc;
+            RegisterClassEx(&wc);
+          m_window = CreateWindow("webview", "", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
+                                  CW_USEDEFAULT, 640, 480, nullptr, nullptr,
+                                  GetModuleHandle(nullptr), nullptr);
+          SetWindowLongPtr(m_window, GWLP_USERDATA, (LONG_PTR)this);
+      } else {
+          m_window = *(static_cast<HWND *>(window));
+      }
 
-    auto cb =
-        std::bind(&win32_edge_engine::on_message, this, std::placeholders::_1);
+      ShowWindow(m_window, SW_SHOW);
+      UpdateWindow(m_window);
+      SetFocus(m_window);
 
-    if (!m_browser->embed(m_window, debug, cb)) {
-      m_browser = std::make_unique<webview::edge_html>();
-      m_browser->embed(m_window, debug, cb);
-    }
+      auto cb =
+          std::bind(&win32_edge_engine::on_message, this, std::placeholders::_1);
 
-    m_browser->resize(m_window);
+      if (!m_browser->embed(m_window, debug, cb)) {
+#ifndef DISABLE_LOCAL_EDGE
+          m_browser = std::make_unique<webview::edge_html>();
+          m_browser->embed(m_window, debug, cb);
+#endif
+      }
+
+      m_browser->resize(m_window);
   }
 
   void run() {
