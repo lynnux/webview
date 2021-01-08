@@ -72,9 +72,9 @@ WEBVIEW_API void *webview_get_window(webview_t w);
 WEBVIEW_API void webview_set_title(webview_t w, const char *title);
 
 // Window size hints
-#define WEBVIEW_HINT_NONE 0  // Width and height are default size
-#define WEBVIEW_HINT_MIN 1   // Width and height are minimum bounds
-#define WEBVIEW_HINT_MAX 2   // Width and height are maximum bounds
+#define WEBVIEW_HINT_NONE 0 // Width and height are default size
+#define WEBVIEW_HINT_MIN 1 // Width and height are minimum bounds
+#define WEBVIEW_HINT_MAX 2 // Width and height are maximum bounds
 #define WEBVIEW_HINT_FIXED 3 // Window size can not be changed by a user
 // Updates native window size. See WEBVIEW_HINT constants.
 WEBVIEW_API void webview_set_size(webview_t w, int width, int height,
@@ -768,6 +768,26 @@ using browser_engine = cocoa_wkwebview_engine;
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "oleaut32.lib")
 
+// cef
+#include "include/base/cef_bind.h"
+#include "include/capi/cef_v8_capi.h"
+#include "include/cef_app.h"
+#include "include/cef_browser.h"
+#include "include/cef_client.h"
+#include "include/cef_scheme.h"
+#include "include/cef_v8.h"
+#include "include/cef_version.h"
+#include "include/wrapper/cef_closure_task.h"
+#include "include/wrapper/cef_helpers.h"
+
+#if defined(OS_WIN)
+// Add Common Controls to the application manifest because it's required to
+// support the default tooltip implementation.
+#pragma comment(                                                               \
+    linker,                                                                    \
+    "/manifestdependency:\"type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"") // NOLINT(whitespace/line_length)
+#endif
+
 namespace webview {
 
 using msg_cb_t = std::function<void(const std::string)>;
@@ -1002,84 +1022,287 @@ private:
   };
 };
 
+// https://bitbucket.org/chromiumembedded/cef/wiki/JavaScriptIntegration.md
+// https://github.com/acristoffers/CEF3SimpleSample
+class MyV8Handler : public CefV8Handler {
+  CefRefPtr<CefBrowser> browser_;
+
+public:
+  MyV8Handler(CefRefPtr<CefBrowser> b) : browser_(b) {}
+  virtual bool Execute(const CefString &name, CefRefPtr<CefV8Value> object,
+                       const CefV8ValueList &arguments,
+                       CefRefPtr<CefV8Value> &retval,
+                       CefString &exception) OVERRIDE {
+    if (name == "on_message") {
+      if (arguments.size() == 1 && arguments[0]->IsString()) {
+        // send message to browser process, handle in CefClient::OnProcessMessageReceived
+        CefRefPtr<CefProcessMessage> msg =
+            CefProcessMessage::Create("on_message");
+        CefRefPtr<CefListValue> args = msg->GetArgumentList();
+        args->SetString(0, arguments[0]->GetStringValue());
+        browser_->SendProcessMessage(PID_BROWSER, msg);
+        return true;
+      }
+    }
+    return false;
+  }
+  IMPLEMENT_REFCOUNTING(MyV8Handler);
+};
+
+// called in browser and render process
+class ClientApp : public CefApp, public CefRenderProcessHandler {
+public:
+  CefRefPtr<CefRenderProcessHandler> GetRenderProcessHandler() { return this; }
+  void OnContextCreated(CefRefPtr<CefBrowser> browser,
+                        CefRefPtr<CefFrame> frame,
+                        CefRefPtr<CefV8Context> context) {
+    // js register window.on_message
+    CefRefPtr<CefV8Value> object = context->GetGlobal();
+    CefRefPtr<CefV8Handler> handler = new MyV8Handler(browser);
+    CefRefPtr<CefV8Value> func =
+        CefV8Value::CreateFunction("on_message", handler);
+    object->SetValue("on_message", func, V8_PROPERTY_ATTRIBUTE_NONE);
+  }
+  IMPLEMENT_REFCOUNTING(ClientApp);
+};
+
+// called in browser process
+class ClientHandler : public CefClient,
+                      public CefLifeSpanHandler,
+                      public CefLoadHandler,
+                      public CefKeyboardHandler {
+  std::string init_js;
+  msg_cb_t m_msgCb;
+
+public:
+  ClientHandler(msg_cb_t cb) : m_msgCb(cb) {}
+  void init(const std::string js) {
+    init_js = init_js + "(function(){" + js + "})();";
+  }
+  CefRefPtr<CefBrowser> GetBrowser() { return m_Browser; }
+  CefWindowHandle GetBrowserHwnd() { return m_BrowserHandle; }
+  virtual CefRefPtr<CefKeyboardHandler> GetKeyboardHandler() { return this; }
+  virtual CefRefPtr<CefLifeSpanHandler> GetLifeSpanHandler() { return this; }
+  virtual CefRefPtr<CefLoadHandler> GetLoadHandler() { return this; }
+  virtual bool DoClose(CefRefPtr<CefBrowser> browser) { return false; }
+  virtual void OnAfterCreated(CefRefPtr<CefBrowser> browser) {
+    if (!m_Browser.get()) {
+      m_Browser = browser;
+      m_BrowserHandle = browser->GetHost()->GetWindowHandle();
+      // it's too early too eval init js here
+    }
+  }
+  virtual void OnLoadStart(CefRefPtr<CefBrowser> browser,
+                           CefRefPtr<CefFrame> frame) {
+    if (frame->IsMain()) {
+      frame->ExecuteJavaScript(init_js, frame->GetURL(), 0);
+    }
+  }
+  virtual void OnBeforeClose(CefRefPtr<CefBrowser> browser) {
+    if (m_BrowserHandle == browser->GetHost()->GetWindowHandle()) {
+      m_Browser = NULL;
+    }
+  }
+  virtual bool OnProcessMessageReceived(CefRefPtr<CefBrowser> browser,
+                                        CefProcessId source_process,
+                                        CefRefPtr<CefProcessMessage> message) {
+    const std::string &message_name = message->GetName();
+    if (message_name == "on_message") {
+      auto args = message->GetArgumentList();
+      m_msgCb(args->GetString(0).ToString());
+      return true;
+    }
+    return false;
+  }
+  virtual bool OnPreKeyEvent(CefRefPtr<CefBrowser> browser,
+                             const CefKeyEvent &event, CefEventHandle os_event,
+                             bool *is_keyboard_shortcut) {
+    if (event.type == KEYEVENT_RAWKEYDOWN) {
+      if (event.windows_key_code == VK_F5) {
+        m_Browser->Reload();
+        return true;
+      } else if (event.windows_key_code == VK_F12) {
+        CefWindowInfo windowInfo;
+        CefBrowserSettings settings;
+        windowInfo.SetAsPopup(NULL, "DevTools");
+        m_Browser->GetHost()->ShowDevTools(windowInfo, this, settings,
+                                           CefPoint());
+        return true;
+      }
+    }
+    return false;
+  }
+
+protected:
+  CefRefPtr<CefBrowser> m_Browser;
+  CefWindowHandle m_BrowserHandle;
+  IMPLEMENT_REFCOUNTING(ClientHandler);
+};
+
+bool webview_cef_init_continue() {
+  CefMainArgs main_args(GetModuleHandle(nullptr));
+  CefRefPtr<ClientApp> app(new ClientApp);
+  int exit_code = CefExecuteProcess(main_args, app.get(), NULL);
+  if (exit_code >= 0) {
+    return false;
+  }
+  return true;
+}
+
+class chrome : public browser,
+               public base::RefCountedThreadSafe<chrome, CefDeleteOnUIThread> {
+  CefRefPtr<ClientHandler> m_handler;
+  std::string init_js;
+
+public:
+  ~chrome() {}
+  virtual bool embed(HWND hwnd, bool, msg_cb_t cb) {
+    CefMainArgs main_args(GetModuleHandle(nullptr));
+    CefRefPtr<ClientApp> app(new ClientApp());
+    CefSettings settings;
+    //settings.multi_threaded_message_loop = true; // this will introduce many problem
+    CefInitialize(main_args, settings, app.get(), NULL);
+    return createBrowser(hwnd, cb);
+  }
+
+  bool createBrowser(HWND hwnd, msg_cb_t cb) {
+    CefWindowInfo info;
+    CefBrowserSettings b_settings;
+    CefRefPtr<ClientHandler> client(new ClientHandler(cb));
+    m_handler = client;
+
+    RECT rect = {0};
+    GetClientRect(hwnd, &rect);
+    info.SetAsChild(hwnd, rect);
+
+    init("window.external={invoke:function(s){window.on_message(s);}}");
+
+    auto browser = CefBrowserHost::CreateBrowserSync(
+        info, client, L"about:blank", b_settings, NULL);
+    return browser != nullptr;
+  }
+  virtual void navigate(const std::string url) {
+    /*if (!CefCurrentlyOn(TID_UI)) {
+      // multi_threaded_message_loop = true need this
+      CefPostTask(TID_UI, base::Bind(&chrome::navigate, this, url));
+      return;
+    }*/
+    m_handler->GetBrowser()->GetMainFrame()->LoadURL(url);
+  }
+  virtual void eval(const std::string js) {
+    /*if (!CefCurrentlyOn(TID_UI)) {
+      // multi_threaded_message_loop = true need this
+      CefPostTask(TID_UI, base::Bind(&chrome::eval, this, js));
+      return;
+    }*/
+    //CefRefPtr<CefFrame> frame = m_browser->GetMainFrame();
+    CefRefPtr<CefFrame> frame = m_handler->GetBrowser()->GetMainFrame();
+    frame->ExecuteJavaScript(js, frame->GetURL(), 0);
+  }
+  virtual void init(const std::string js) {
+    if (m_handler)
+      m_handler->init(js);
+  }
+  void dispatch(dispatch_fn_t f) {
+    if (!CefCurrentlyOn(TID_UI)) {
+      // Execute this method on the UI thread.
+      CefPostTask(TID_UI, base::Bind(&chrome::dispatch, this, f));
+      return;
+    }
+    f();
+  }
+  virtual void resize(HWND hwnd) {
+    if (!m_handler)
+      return;
+    RECT rect;
+    GetClientRect(hwnd, &rect);
+    HDWP hdwp = BeginDeferWindowPos(1);
+    hdwp = DeferWindowPos(hdwp, m_handler->GetBrowserHwnd(), NULL, rect.left,
+                          rect.top, rect.right - rect.left,
+                          rect.bottom - rect.top, SWP_NOZORDER);
+    EndDeferWindowPos(hdwp);
+  }
+};
+
 class win32_edge_engine {
 public:
-    static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
-        {
-            auto w = (win32_edge_engine *)GetWindowLongPtr(hwnd, GWLP_USERDATA);
-            switch (msg) {
-            case WM_SIZE:
-                w->m_browser->resize(hwnd);
-                break;
-            case WM_CLOSE:
-                DestroyWindow(hwnd);
-                break;
-            case WM_DESTROY:
-                w->terminate();
-                break;
-            case WM_GETMINMAXINFO: {
-                auto lpmmi = (LPMINMAXINFO)lp;
-                if (w == nullptr) {
-                    return 0;
-                }
-                if (w->m_maxsz.x > 0 && w->m_maxsz.y > 0) {
-                    lpmmi->ptMaxSize = w->m_maxsz;
-                    lpmmi->ptMaxTrackSize = w->m_maxsz;
-                }
-                if (w->m_minsz.x > 0 && w->m_minsz.y > 0) {
-                    lpmmi->ptMinTrackSize = w->m_minsz;
-                }
-            } break;
-            default:
-                return DefWindowProc(hwnd, msg, wp, lp);
-            }
-            return 0;
-        }
-    win32_edge_engine(bool debug, void *window) {
-        if (window == nullptr) {
-            HINSTANCE hInstance = GetModuleHandle(nullptr);
-            HICON icon = (HICON) LoadImage(
-                hInstance, IDI_APPLICATION, IMAGE_ICON,
-                GetSystemMetrics(SM_CXSMICON), 
-                GetSystemMetrics(SM_CYSMICON), 
-                LR_DEFAULTCOLOR);
-
-            WNDCLASSEX wc;
-            ZeroMemory(&wc, sizeof(WNDCLASSEX));
-            wc.cbSize = sizeof(WNDCLASSEX);
-            wc.hInstance = hInstance;
-            wc.lpszClassName = "webview";
-            wc.hIcon = icon;
-            wc.hIconSm = icon;
-            wc.lpfnWndProc =
-                (WNDPROC)WndProc;
-            RegisterClassEx(&wc);
-          m_window = CreateWindow("webview", "", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
-                                  CW_USEDEFAULT, 640, 480, nullptr, nullptr,
-                                  GetModuleHandle(nullptr), nullptr);
-          SetWindowLongPtr(m_window, GWLP_USERDATA, (LONG_PTR)this);
-      } else {
-          m_window = *(static_cast<HWND *>(window));
+  static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    auto w = (win32_edge_engine *)GetWindowLongPtr(hwnd, GWLP_USERDATA);
+    switch (msg) {
+    case WM_SIZE:
+      w->m_browser->resize(hwnd);
+      break;
+    case WM_CLOSE:
+      DestroyWindow(hwnd);
+      break;
+    case WM_DESTROY:
+      w->terminate();
+      break;
+    case WM_GETMINMAXINFO: {
+      auto lpmmi = (LPMINMAXINFO)lp;
+      if (w == nullptr) {
+        return 0;
       }
+      if (w->m_maxsz.x > 0 && w->m_maxsz.y > 0) {
+        lpmmi->ptMaxSize = w->m_maxsz;
+        lpmmi->ptMaxTrackSize = w->m_maxsz;
+      }
+      if (w->m_minsz.x > 0 && w->m_minsz.y > 0) {
+        lpmmi->ptMinTrackSize = w->m_minsz;
+      }
+    } break;
+    default:
+      return DefWindowProc(hwnd, msg, wp, lp);
+    }
+    return 0;
+  }
+  win32_edge_engine(bool debug, void *window) {
+    if (!webview_cef_init_continue()) {
+      exit(0);
+    }
 
-      ShowWindow(m_window, SW_SHOW);
-      UpdateWindow(m_window);
-      SetFocus(m_window);
+    if (window == nullptr) {
+      HINSTANCE hInstance = GetModuleHandle(nullptr);
+      HICON icon = (HICON)LoadImage(
+          hInstance, IDI_APPLICATION, IMAGE_ICON, GetSystemMetrics(SM_CXSMICON),
+          GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR);
 
-      auto cb =
-          std::bind(&win32_edge_engine::on_message, this, std::placeholders::_1);
+      WNDCLASSEX wc;
+      ZeroMemory(&wc, sizeof(WNDCLASSEX));
+      wc.cbSize = sizeof(WNDCLASSEX);
+      wc.hInstance = hInstance;
+      wc.lpszClassName = "webview";
+      wc.hIcon = icon;
+      wc.hIconSm = icon;
+      wc.lpfnWndProc = (WNDPROC)WndProc;
+      RegisterClassEx(&wc);
+      m_window = CreateWindow("webview", "", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
+                              CW_USEDEFAULT, 640, 480, nullptr, nullptr,
+                              GetModuleHandle(nullptr), nullptr);
+      SetWindowLongPtr(m_window, GWLP_USERDATA, (LONG_PTR)this);
+    } else {
+      m_window = *(static_cast<HWND *>(window));
+    }
 
-      if (!m_browser->embed(m_window, debug, cb)) {
+    ShowWindow(m_window, SW_SHOW);
+    UpdateWindow(m_window);
+    SetFocus(m_window);
+
+    auto cb =
+        std::bind(&win32_edge_engine::on_message, this, std::placeholders::_1);
+
+    if (!m_browser->embed(m_window, debug, cb)) {
 #ifndef DISABLE_LOCAL_EDGE
-          m_browser = std::make_unique<webview::edge_html>();
-          m_browser->embed(m_window, debug, cb);
+      m_browser = std::make_unique<webview::edge_html>();
+      m_browser->embed(m_window, debug, cb);
 #endif
-      }
+    }
 
-      m_browser->resize(m_window);
+    m_browser->resize(m_window);
   }
 
   void run() {
+    /*
     MSG msg;
     BOOL res;
     while ((res = GetMessage(&msg, nullptr, 0, 0)) != -1) {
@@ -1095,14 +1318,19 @@ public:
       } else if (msg.message == WM_QUIT) {
         return;
       }
-    }
+    }*/
+    CefRunMessageLoop(); // multi_threaded_message_loop = false need this
+    CefShutdown();       // you can't call this in other place
   }
   void *window() { return (void *)m_window; }
   void terminate() {
-      PostThreadMessage(m_main_thread, WM_QUIT, 0, 0);
+    m_browser = 0;
+    PostThreadMessage(m_main_thread, WM_QUIT, 0, 0);
+    CefQuitMessageLoop();
   }
   void dispatch(dispatch_fn_t f) {
-    PostThreadMessage(m_main_thread, WM_APP, 0, (LPARAM) new dispatch_fn_t(f));
+    //PostThreadMessage(m_main_thread, WM_APP, 0, (LPARAM) new dispatch_fn_t(f));
+    m_browser->dispatch(f);
   }
 
   void set_title(const std::string title) {
@@ -1148,8 +1376,7 @@ private:
   POINT m_minsz = POINT{0, 0};
   POINT m_maxsz = POINT{0, 0};
   DWORD m_main_thread = GetCurrentThreadId();
-  std::unique_ptr<webview::browser> m_browser =
-      std::make_unique<webview::edge_chromium>();
+  CefRefPtr<webview::chrome> m_browser = new webview::chrome();
 };
 
 using browser_engine = win32_edge_engine;
